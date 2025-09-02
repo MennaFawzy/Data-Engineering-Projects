@@ -1,0 +1,234 @@
+services:
+  # ===============================
+  # Kafka broker (KRaft mode, no Zookeeper)
+  # ===============================
+  kafka:
+    image: confluentinc/cp-kafka:7.6.1
+    hostname: kafka
+    container_name: kafka
+    ports:
+      - "9092:9092"   # Host access to Kafka
+      - "29092:29092" # Internal Docker access for other containers
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: 'CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT'
+      KAFKA_ADVERTISED_LISTENERS: 'PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092'
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_JMX_PORT: 9101
+      KAFKA_JMX_HOSTNAME: localhost
+      KAFKA_PROCESS_ROLES: 'broker,controller'
+      KAFKA_CONTROLLER_QUORUM_VOTERS: '1@kafka:29093'
+      KAFKA_LISTENERS: 'PLAINTEXT://kafka:29092,CONTROLLER://kafka:29093,PLAINTEXT_HOST://0.0.0.0:9092'
+      KAFKA_INTER_BROKER_LISTENER_NAME: 'PLAINTEXT'
+      KAFKA_CONTROLLER_LISTENER_NAMES: 'CONTROLLER'
+      KAFKA_LOG_DIRS: '/tmp/kraft-combined-logs'
+      CLUSTER_ID: 'cvZKqLXJRbC7BwivmARntQ'
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics --bootstrap-server localhost:9092 --list"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+
+  # ===============================
+  # Kafka Connect
+  # ===============================
+  kafka-connect:
+    image: confluentinc/cp-kafka-connect:7.7.1
+    container_name: kafka-connect
+    hostname: kafka-connect
+    # depends_on:
+    #   kafka:
+    #     condition: service_healthy
+    ports:
+      - "8083:8083"
+    environment:
+      CONNECT_REST_ADVERTISED_HOST_NAME: kafka-connect
+      CONNECT_BOOTSTRAP_SERVERS: kafka:29092 # Internal broker address
+      CONNECT_REST_PORT: 8083
+      CONNECT_GROUP_ID: "kafka-connect-group"
+      CONNECT_CONFIG_STORAGE_TOPIC: connect-configs
+      CONNECT_OFFSET_STORAGE_TOPIC: connect-offsets
+      CONNECT_STATUS_STORAGE_TOPIC: connect-statuses
+      CONNECT_KEY_CONVERTER: "org.apache.kafka.connect.json.JsonConverter"
+      CONNECT_VALUE_CONVERTER: "org.apache.kafka.connect.json.JsonConverter"
+      CONNECT_INTERNAL_KEY_CONVERTER: "org.apache.kafka.connect.json.JsonConverter"
+      CONNECT_INTERNAL_VALUE_CONVERTER: "org.apache.kafka.connect.json.JsonConverter"
+      CONNECT_PLUGIN_PATH: "/usr/share/java,/etc/kafka-connect/jars"
+      CONNECT_CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      CONNECT_OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      CONNECT_STATUS_STORAGE_REPLICATION_FACTOR: 1
+      CONNECT_LOG4J_LOGGERS: "org.reflections=ERROR"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8083/connectors || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - ./connect-plugins:/etc/kafka-connect/jars # Custom connectors go here
+
+  # ===============================
+  # Kafka UI (web-based monitoring)
+  # ===============================
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka-ui-project
+    ports:
+      - "8080:8080"
+    depends_on:
+      - kafka
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+
+  # ===============================
+  # Postgres for CDC testing
+  # ===============================
+  postgres:
+    image: postgres:15-alpine
+    container_name: postgres-project
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./postgres-init.sql:/docker-entrypoint-initdb.d/init.sql
+    command: ["postgres", "-c", "wal_level=logical", "-c", "max_replication_slots=10", "-c", "max_wal_senders=10"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ===============================
+  # NiFi
+  # ===============================
+  nifi:
+    build:
+      context: .
+      dockerfile: Dockerfile.nifi
+    environment:
+      SINGLE_USER_CREDENTIALS_USERNAME: admin
+      SINGLE_USER_CREDENTIALS_PASSWORD: ctsBtRBKHRAx69EqUghvvgEvjnaLjFEB
+    ports:
+      - "8443:8443"
+    volumes:
+      - nifi_data:/opt/nifi/nifi-current/data
+      - ./data:/data
+
+  # ===============================
+  # Flink JobManager
+  # ===============================
+  jobmanager:
+    build:
+      context: ./flink # Dockerfile here should install PyFlink + connectors
+    ports:
+      - "8081:8081" # Flink Web UI
+    command: jobmanager
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: jobmanager        
+    volumes:
+      # - ./flink/connectors:/opt/flink/lib  
+      - ./flink/sql_jobs:/opt/flink/sql_jobs
+      - ./flink/python_jobs:/opt/flink/python_jobs
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1.5g
+        reservations:
+          cpus: '0.5'
+          memory: 1g
+  # ===============================
+  # Flink TaskManager
+  # ===============================
+  taskmanager:
+    build:
+      context: ./flink
+    depends_on:
+      - jobmanager
+    command: taskmanager
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: jobmanager
+        taskmanager.numberOfTaskSlots: 2 
+    volumes:
+      # - ./flink/connectors:/opt/flink/lib
+      - ./flink/sql_jobs:/opt/flink/sql_jobs
+      - ./flink/python_jobs:/opt/flink/python_jobs
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 2g
+        reservations:
+          cpus: '0.5'
+          memory: 1g
+
+  # ===============================
+  # Flink SQL Client
+  # ===============================
+  sql-client:
+    build:
+      context: ./flink
+    command: bin/sql-client.sh
+    depends_on:
+      - jobmanager
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: jobmanager
+        rest.address: jobmanager
+    volumes:
+      # - ./flink/connectors:/opt/flink/lib
+      - ./flink/sql_jobs:/opt/flink/sql_jobs
+      - ./flink/python_jobs:/opt/flink/python_jobs
+
+  # ===============================
+  # Cassandra (for storage experiments)
+  # ===============================
+  cassandra:
+    image: cassandra:4.1
+    container_name: cassandra
+    ports:
+      - "9042:9042"
+    environment:
+      CASSANDRA_START_RPC: "true"
+    volumes:
+      - ./cassandra-init.cql:/init.cql
+      - cassandra_data:/var/lib/cassandra
+
+  # ===============================
+  # Grafana (dashboard for monitoring)
+  # ===============================
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_INSTALL_PLUGINS=hadesarchitect-cassandra-datasource
+    volumes:
+      - grafana-storage:/var/lib/grafana
+
+# ===============================
+# Named volumes for persistent data
+# ===============================
+volumes:
+  pgdata:
+  grafana-storage:
+  cassandra_data:
+  kafka-data:
+  nifi_data:

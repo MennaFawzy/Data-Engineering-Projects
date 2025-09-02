@@ -1,0 +1,11 @@
+# Track all CSV datasets
+data/*.csv filter=lfs diff=lfs merge=lfs -text
+
+# Track the Cassandra connector plugin
+connect-plugins/kafka-connect-cassandra-sink-10.0.0/* filter=lfs diff=lfs merge=lfs -text
+
+# Track Flink connector JARs
+flink/connectors/*.jar filter=lfs diff=lfs merge=lfs -text
+
+# Track extra JARs in python_jobs
+flink/python_jobs/kafka-python/*.jar filter=lfs diff=lfs merge=lfs -text
